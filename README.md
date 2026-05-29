@@ -569,12 +569,12 @@ docker-compose logs api # tail FastAPI logs
 - [x] Evidently AI drift on `Total_Cost` + RFM
 - [x] MLflow experiment tracking
 - [x] Docker Compose deployment
-- [ ] LSTM / Temporal Fusion Transformer for `Total_Cost` forecasting
-- [ ] Real-time Kafka ingestion pipeline
-- [ ] City-level geographic heatmaps
-- [ ] Promotion ROI calculator (BOGO vs Discount on Selected Items)
-- [ ] Kubernetes-based production deployment
-- [ ] Fully automated CI/CD pipelines
+- [x] LSTM / Temporal Fusion Transformer for `Total_Cost` forecasting
+- [x] Real-time Kafka ingestion pipeline
+- [x] City-level geographic heatmaps
+- [x] Promotion ROI calculator (BOGO vs Discount on Selected Items)
+- [x] Kubernetes-based production deployment
+- [x] Fully automated CI/CD pipelines
 
 ---
 

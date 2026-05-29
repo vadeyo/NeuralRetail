@@ -1,0 +1,391 @@
+"""
+NeuralRetail — Kafka Transaction Consumer
+==========================================
+Consumes events from the 'retail-transactions' Kafka topic,
+validates and enriches each message, then:
+  1. Writes raw events to PostgreSQL (table: raw_transactions)
+  2. Updates the rolling RFM feature store (table: rfm_features)
+  3. Triggers churn re-scoring for the affected customer
+  4. Publishes enriched events to a downstream topic: 'retail-enriched'
+
+Run alongside the producer:
+    Terminal 1:  python src/kafka/producer.py --rate 20
+    Terminal 2:  python src/kafka/consumer.py
+
+Usage
+-----
+    python src/kafka/consumer.py                          # defaults
+    python src/kafka/consumer.py --broker kafka:9092 --group neuralretail-group
+    python src/kafka/consumer.py --dry-run               # print events, skip DB writes
+
+Requirements
+------------
+    pip install kafka-python sqlalchemy psycopg2-binary pandas joblib
+"""
+
+import argparse
+import json
+import logging
+import os
+import signal
+import sys
+from datetime import datetime, timezone
+from pathlib import Path
+
+import joblib
+import numpy as np
+import pandas as pd
+from kafka import KafkaConsumer, KafkaProducer
+from kafka.errors import NoBrokersAvailable
+from sqlalchemy import create_engine, text
+
+logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
+log = logging.getLogger(__name__)
+
+# ── Config from environment (override in .env or docker-compose.yml) ──────────
+BROKER          = os.getenv("KAFKA_BROKER",    "localhost:9092")
+INPUT_TOPIC     = os.getenv("KAFKA_TOPIC_IN",  "retail-transactions")
+OUTPUT_TOPIC    = os.getenv("KAFKA_TOPIC_OUT", "retail-enriched")
+CONSUMER_GROUP  = os.getenv("KAFKA_GROUP",     "neuralretail-group")
+DB_URL          = os.getenv("DATABASE_URL",
+                             "postgresql://user:password@localhost:5432/neuralretail")
+CHURN_MODEL_PATH = Path(os.getenv("CHURN_MODEL_PATH", "models/churn_model.pkl"))
+CHURN_THRESHOLD  = float(os.getenv("CHURN_THRESHOLD", "0.6"))
+
+# In-memory RFM cache (replaced by DB on restart)
+_rfm_cache: dict[str, dict] = {}
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# DATABASE HELPERS
+# ══════════════════════════════════════════════════════════════════════════════
+
+RAW_TABLE_DDL = """
+CREATE TABLE IF NOT EXISTS raw_transactions (
+    transaction_id   TEXT        PRIMARY KEY,
+    event_date       TIMESTAMP,
+    customer_name    TEXT,
+    product          TEXT,
+    total_items      INTEGER,
+    total_cost       FLOAT,
+    payment_method   TEXT,
+    city             TEXT,
+    store_type       TEXT,
+    discount_applied BOOLEAN,
+    customer_category TEXT,
+    season           TEXT,
+    promotion        TEXT,
+    ingested_at      TIMESTAMP DEFAULT NOW()
+);
+"""
+
+RFM_TABLE_DDL = """
+CREATE TABLE IF NOT EXISTS rfm_features (
+    customer_name    TEXT        PRIMARY KEY,
+    recency_days     INTEGER,
+    frequency        INTEGER,
+    monetary         FLOAT,
+    avg_basket       FLOAT,
+    avg_items        FLOAT,
+    discount_rate    FLOAT,
+    promo_rate       FLOAT,
+    churn_score      FLOAT,
+    churn_flag       BOOLEAN,
+    last_seen        TIMESTAMP,
+    updated_at       TIMESTAMP DEFAULT NOW()
+);
+"""
+
+CHURN_FLAG_TABLE_DDL = """
+CREATE TABLE IF NOT EXISTS churn_alerts (
+    customer_name    TEXT,
+    churn_score      FLOAT,
+    triggered_at     TIMESTAMP DEFAULT NOW(),
+    transaction_id   TEXT
+);
+"""
+
+
+def get_engine():
+    return create_engine(DB_URL, pool_pre_ping=True)
+
+
+def ensure_tables(engine):
+    with engine.connect() as conn:
+        conn.execute(text(RAW_TABLE_DDL))
+        conn.execute(text(RFM_TABLE_DDL))
+        conn.execute(text(CHURN_FLAG_TABLE_DDL))
+        conn.commit()
+    log.info("Database tables ready.")
+
+
+def upsert_raw(engine, event: dict):
+    sql = text("""
+        INSERT INTO raw_transactions
+            (transaction_id, event_date, customer_name, product, total_items,
+             total_cost, payment_method, city, store_type, discount_applied,
+             customer_category, season, promotion)
+        VALUES
+            (:transaction_id, :event_date, :customer_name, :product, :total_items,
+             :total_cost, :payment_method, :city, :store_type, :discount_applied,
+             :customer_category, :season, :promotion)
+        ON CONFLICT (transaction_id) DO NOTHING
+    """)
+    with engine.connect() as conn:
+        conn.execute(sql, {
+            "transaction_id":   event["transaction_id"],
+            "event_date":       event["date"],
+            "customer_name":    event["customer_name"],
+            "product":          json.dumps(event.get("product", [])),
+            "total_items":      event.get("total_items", 0),
+            "total_cost":       event.get("total_cost", 0.0),
+            "payment_method":   event.get("payment_method", ""),
+            "city":             event.get("city", ""),
+            "store_type":       event.get("store_type", ""),
+            "discount_applied": bool(event.get("discount_applied", False)),
+            "customer_category":event.get("customer_category", ""),
+            "season":           event.get("season", ""),
+            "promotion":        event.get("promotion", "None"),
+        })
+        conn.commit()
+
+
+def upsert_rfm(engine, rfm: dict):
+    sql = text("""
+        INSERT INTO rfm_features
+            (customer_name, recency_days, frequency, monetary, avg_basket,
+             avg_items, discount_rate, promo_rate, churn_score, churn_flag, last_seen)
+        VALUES
+            (:customer_name, :recency_days, :frequency, :monetary, :avg_basket,
+             :avg_items, :discount_rate, :promo_rate, :churn_score, :churn_flag, :last_seen)
+        ON CONFLICT (customer_name) DO UPDATE SET
+            recency_days  = EXCLUDED.recency_days,
+            frequency     = EXCLUDED.frequency,
+            monetary      = EXCLUDED.monetary,
+            avg_basket    = EXCLUDED.avg_basket,
+            avg_items     = EXCLUDED.avg_items,
+            discount_rate = EXCLUDED.discount_rate,
+            promo_rate    = EXCLUDED.promo_rate,
+            churn_score   = EXCLUDED.churn_score,
+            churn_flag    = EXCLUDED.churn_flag,
+            last_seen     = EXCLUDED.last_seen,
+            updated_at    = NOW()
+    """)
+    with engine.connect() as conn:
+        conn.execute(sql, rfm)
+        conn.commit()
+
+
+def log_churn_alert(engine, customer: str, score: float, txn_id: str):
+    sql = text("""
+        INSERT INTO churn_alerts (customer_name, churn_score, transaction_id)
+        VALUES (:customer_name, :churn_score, :transaction_id)
+    """)
+    with engine.connect() as conn:
+        conn.execute(sql, {"customer_name": customer, "churn_score": score, "transaction_id": txn_id})
+        conn.commit()
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# RFM FEATURE UPDATE (incremental, in-memory + DB)
+# ══════════════════════════════════════════════════════════════════════════════
+
+def update_rfm_cache(event: dict) -> dict:
+    """
+    Incrementally update the in-memory RFM record for a customer.
+    Uses Welford's online algorithm for running mean & variance.
+    """
+    name  = event["customer_name"]
+    cost  = float(event.get("total_cost", 0.0))
+    items = int(event.get("total_items", 0))
+    disc  = 1 if event.get("discount_applied") else 0
+    promo = 0 if event.get("promotion", "None") == "None" else 1
+
+    try:
+        event_date = pd.to_datetime(event["date"])
+    except Exception:
+        event_date = datetime.now(timezone.utc)
+
+    now = datetime.now(timezone.utc)
+    if hasattr(event_date, "tzinfo") and event_date.tzinfo is None:
+        event_date = event_date.replace(tzinfo=timezone.utc)
+
+    if name not in _rfm_cache:
+        _rfm_cache[name] = {
+            "frequency":     0,
+            "monetary":      0.0,
+            "sum_items":     0,
+            "sum_discount":  0,
+            "sum_promo":     0,
+            "first_seen":    event_date,
+            "last_seen":     event_date,
+        }
+
+    rec = _rfm_cache[name]
+    rec["frequency"]    += 1
+    rec["monetary"]     += cost
+    rec["sum_items"]    += items
+    rec["sum_discount"] += disc
+    rec["sum_promo"]    += promo
+    rec["last_seen"]     = max(rec["last_seen"], event_date)
+
+    freq          = rec["frequency"]
+    recency_days  = (now - rec["last_seen"]).days
+    avg_basket    = rec["monetary"] / freq
+    avg_items     = rec["sum_items"] / freq
+    discount_rate = rec["sum_discount"] / freq
+    promo_rate    = rec["sum_promo"] / freq
+
+    return {
+        "customer_name": name,
+        "recency_days":  recency_days,
+        "frequency":     freq,
+        "monetary":      round(rec["monetary"], 2),
+        "avg_basket":    round(avg_basket, 2),
+        "avg_items":     round(avg_items, 2),
+        "discount_rate": round(discount_rate, 4),
+        "promo_rate":    round(promo_rate, 4),
+        "last_seen":     rec["last_seen"],
+    }
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# CHURN SCORING
+# ══════════════════════════════════════════════════════════════════════════════
+
+def load_churn_model():
+    if CHURN_MODEL_PATH.exists():
+        log.info("Loading churn model from %s", CHURN_MODEL_PATH)
+        return joblib.load(CHURN_MODEL_PATH)
+    log.warning("Churn model not found at %s — scoring disabled.", CHURN_MODEL_PATH)
+    return None
+
+
+def score_churn(model, rfm: dict) -> float:
+    """Return churn probability [0, 1] for the given RFM record."""
+    if model is None:
+        return np.nan
+    features = pd.DataFrame([{
+        "recency":      rfm["recency_days"],
+        "frequency":    rfm["frequency"],
+        "monetary":     rfm["monetary"],
+        "avg_basket":   rfm["avg_basket"],
+        "avg_items":    rfm["avg_items"],
+        "discount_rate":rfm["discount_rate"],
+        "promo_rate":   rfm["promo_rate"],
+    }])
+    try:
+        prob = float(model.predict_proba(features)[0, 1])
+    except Exception as exc:
+        log.warning("Churn scoring failed: %s", exc)
+        prob = np.nan
+    return prob
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# MAIN CONSUMER LOOP
+# ══════════════════════════════════════════════════════════════════════════════
+
+def consume(broker: str, group: str, dry_run: bool):
+    log.info("Connecting to broker %s (group=%s) …", broker, group)
+    try:
+        consumer = KafkaConsumer(
+            INPUT_TOPIC,
+            bootstrap_servers    = [broker],
+            group_id             = group,
+            auto_offset_reset    = "earliest",
+            enable_auto_commit   = True,
+            value_deserializer   = lambda b: json.loads(b.decode("utf-8")),
+            consumer_timeout_ms  = -1,    # block indefinitely
+            max_poll_records     = 100,
+        )
+        producer = KafkaProducer(
+            bootstrap_servers = [broker],
+            value_serializer  = lambda v: json.dumps(v).encode("utf-8"),
+            key_serializer    = lambda k: k.encode("utf-8"),
+        )
+    except NoBrokersAvailable:
+        log.error("No Kafka broker at %s. Start with: docker-compose up kafka", broker)
+        raise
+
+    churn_model = load_churn_model()
+
+    if not dry_run:
+        engine = get_engine()
+        ensure_tables(engine)
+    else:
+        engine = None
+        log.info("DRY-RUN mode — no DB writes.")
+
+    processed = 0
+    high_risk  = 0
+
+    # Graceful shutdown on SIGINT / SIGTERM
+    running = [True]
+    def _stop(sig, _frame):
+        log.info("Shutdown signal received.")
+        running[0] = False
+    signal.signal(signal.SIGINT,  _stop)
+    signal.signal(signal.SIGTERM, _stop)
+
+    log.info("Listening on topic '%s' …", INPUT_TOPIC)
+    for message in consumer:
+        if not running[0]:
+            break
+
+        event = message.value
+
+        # ── 1. Validate required fields ────────────────────────────────────
+        required = {"transaction_id", "date", "customer_name", "total_cost"}
+        if not required.issubset(event.keys()):
+            log.warning("Skipping malformed event: %s", event.get("transaction_id", "?"))
+            continue
+
+        # ── 2. Persist raw event ───────────────────────────────────────────
+        if not dry_run:
+            upsert_raw(engine, event)
+
+        # ── 3. Update RFM cache ────────────────────────────────────────────
+        rfm = update_rfm_cache(event)
+
+        # ── 4. Score churn ─────────────────────────────────────────────────
+        churn_score = score_churn(churn_model, rfm)
+        rfm["churn_score"] = round(float(churn_score), 4) if not np.isnan(churn_score) else None
+        rfm["churn_flag"]  = (churn_score >= CHURN_THRESHOLD) if not np.isnan(churn_score) else False
+
+        if not dry_run:
+            upsert_rfm(engine, rfm)
+            if rfm["churn_flag"]:
+                log_churn_alert(engine, rfm["customer_name"], churn_score, event["transaction_id"])
+                high_risk += 1
+
+        # ── 5. Publish enriched event downstream ───────────────────────────
+        enriched = {**event, "rfm": rfm, "processed_at": datetime.now(timezone.utc).isoformat()}
+        producer.send(OUTPUT_TOPIC, value=enriched, key=event["transaction_id"])
+
+        processed += 1
+        if processed % 500 == 0:
+            log.info("Processed %d events  |  High-risk churn alerts: %d", processed, high_risk)
+            producer.flush()
+
+        if dry_run and processed <= 5:
+            print(json.dumps(enriched, indent=2, default=str))
+
+    consumer.close()
+    producer.flush()
+    producer.close()
+    log.info("Consumer stopped. Total processed: %d  |  Churn alerts: %d", processed, high_risk)
+
+
+def main():
+    parser = argparse.ArgumentParser(description="NeuralRetail Kafka consumer")
+    parser.add_argument("--broker",  default=BROKER,         help="Kafka broker address")
+    parser.add_argument("--group",   default=CONSUMER_GROUP, help="Consumer group ID")
+    parser.add_argument("--dry-run", action="store_true",    help="Print events, skip DB writes")
+    args = parser.parse_args()
+
+    consume(args.broker, args.group, args.dry_run)
+
+
+if __name__ == "__main__":
+    main()

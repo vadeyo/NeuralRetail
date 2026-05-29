@@ -1,0 +1,483 @@
+"""
+NeuralRetail — Deep Forecasting Models
+=======================================
+Trains two models on daily aggregated Total_Cost:
+  1. LSTM  — fast baseline, good for single-step horizons
+  2. Temporal Fusion Transformer (TFT) — state-of-the-art multi-horizon,
+     handles known future inputs (Season, Promotion) natively
+
+Usage
+-----
+    # Train LSTM only
+    python src/models/train_deep_forecasting.py --model lstm
+
+    # Train TFT (recommended)
+    python src/models/train_deep_forecasting.py --model tft
+
+    # Train both and compare
+    python src/models/train_deep_forecasting.py --model both
+
+    # Override horizon / epochs
+    python src/models/train_deep_forecasting.py --model tft --horizon 30 --epochs 50
+
+Requirements
+------------
+    pip install pytorch-forecasting pytorch-lightning mlflow scikit-learn pandas torch
+"""
+
+import argparse
+import logging
+import warnings
+from pathlib import Path
+
+import mlflow
+import numpy as np
+import pandas as pd
+import torch
+from sklearn.preprocessing import LabelEncoder, MinMaxScaler
+
+warnings.filterwarnings("ignore")
+logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
+log = logging.getLogger(__name__)
+
+# ── Paths ──────────────────────────────────────────────────────────────────────
+DATA_PATH   = Path("data/raw/retail_transactions.csv")
+OUTPUT_DIR  = Path("models/deep")
+OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
+
+# ── Constants ──────────────────────────────────────────────────────────────────
+TARGET          = "Total_Cost"
+DATE_COL        = "Date"
+CITY_COL        = "City"
+STORE_COL       = "Store_Type"
+SEASON_COL      = "Season"
+PROMO_COL       = "Promotion"
+DISCOUNT_COL    = "Discount_Applied"
+DEFAULT_HORIZON = 14   # forecast steps ahead
+DEFAULT_ENCODER = 60   # look-back window for LSTM / TFT encoder
+DEFAULT_EPOCHS  = 30
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# DATA PREPARATION
+# ══════════════════════════════════════════════════════════════════════════════
+
+def load_and_aggregate(path: Path) -> pd.DataFrame:
+    """
+    Load retail_transactions.csv and produce a daily time-series DataFrame.
+    Groups by Date × City × Store_Type and sums Total_Cost.
+    Also engineers:
+      - is_promoted   : 1 if Promotion != 'None'
+      - discount_flag : 1 if Discount_Applied == True
+      - season_enc    : integer-encoded Season (0-3)
+    """
+    log.info("Loading %s …", path)
+    df = pd.read_csv(path, parse_dates=[DATE_COL])
+    df[DATE_COL] = df[DATE_COL].dt.normalize()   # strip time component
+
+    # Encode categoricals before aggregation so we can carry them through
+    le_season = LabelEncoder()
+    df["season_enc"] = le_season.fit_transform(df[SEASON_COL].fillna("Unknown"))
+
+    promo_map = {"None": 0, "BOGO": 1, "Discount on Selected Items": 2}
+    df["is_promoted"]   = df[PROMO_COL].map(promo_map).fillna(0).astype(int)
+    df["discount_flag"] = df[DISCOUNT_COL].astype(int)
+
+    daily = (
+        df.groupby([DATE_COL, CITY_COL, STORE_COL])
+        .agg(
+            Total_Cost    = (TARGET,        "sum"),
+            season_enc    = ("season_enc",   "first"),
+            is_promoted   = ("is_promoted",  "max"),
+            discount_flag = ("discount_flag","max"),
+        )
+        .reset_index()
+        .sort_values(DATE_COL)
+    )
+
+    # Fill missing dates per group with 0 revenue
+    groups = []
+    full_dates = pd.date_range(daily[DATE_COL].min(), daily[DATE_COL].max(), freq="D")
+    for (city, store), grp in daily.groupby([CITY_COL, STORE_COL]):
+        grp = grp.set_index(DATE_COL).reindex(full_dates, fill_value=0).reset_index()
+        grp.rename(columns={"index": DATE_COL}, inplace=True)
+        grp[CITY_COL]  = city
+        grp[STORE_COL] = store
+        groups.append(grp)
+
+    daily = pd.concat(groups, ignore_index=True).sort_values(DATE_COL)
+    log.info("Daily series shape: %s", daily.shape)
+    return daily, le_season
+
+
+def add_time_features(df: pd.DataFrame) -> pd.DataFrame:
+    """Add cyclical time features (sin/cos) and standard lag/rolling features."""
+    df = df.copy()
+    df["day_of_week"]  = df[DATE_COL].dt.dayofweek
+    df["day_of_month"] = df[DATE_COL].dt.day
+    df["month"]        = df[DATE_COL].dt.month
+    df["week_of_year"] = df[DATE_COL].dt.isocalendar().week.astype(int)
+
+    # Cyclical encoding prevents discontinuity at week/year boundaries
+    df["dow_sin"]   = np.sin(2 * np.pi * df["day_of_week"]  / 7)
+    df["dow_cos"]   = np.cos(2 * np.pi * df["day_of_week"]  / 7)
+    df["month_sin"] = np.sin(2 * np.pi * df["month"]        / 12)
+    df["month_cos"] = np.cos(2 * np.pi * df["month"]        / 12)
+
+    # Lag & rolling features per city/store group
+    df = df.sort_values([CITY_COL, STORE_COL, DATE_COL])
+    for lag in [1, 7, 14]:
+        df[f"lag_{lag}"] = (
+            df.groupby([CITY_COL, STORE_COL])[TARGET]
+            .shift(lag)
+            .fillna(0)
+        )
+    for window in [7, 14, 30]:
+        df[f"rolling_{window}"] = (
+            df.groupby([CITY_COL, STORE_COL])[TARGET]
+            .transform(lambda x: x.shift(1).rolling(window, min_periods=1).mean())
+            .fillna(0)
+        )
+    return df
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# LSTM MODEL
+# ══════════════════════════════════════════════════════════════════════════════
+
+class LSTMDataset(torch.utils.data.Dataset):
+    """Sliding-window dataset for single-city/store LSTM training."""
+
+    def __init__(self, series: np.ndarray, encoder_len: int, horizon: int):
+        self.X, self.y = [], []
+        for i in range(len(series) - encoder_len - horizon + 1):
+            self.X.append(series[i : i + encoder_len])
+            self.y.append(series[i + encoder_len : i + encoder_len + horizon, 0])
+        self.X = torch.tensor(np.array(self.X), dtype=torch.float32)
+        self.y = torch.tensor(np.array(self.y), dtype=torch.float32)
+
+    def __len__(self):
+        return len(self.X)
+
+    def __getitem__(self, idx):
+        return self.X[idx], self.y[idx]
+
+
+class LSTMForecaster(torch.nn.Module):
+    def __init__(self, input_size: int, hidden_size: int, num_layers: int, horizon: int, dropout: float = 0.2):
+        super().__init__()
+        self.lstm = torch.nn.LSTM(
+            input_size, hidden_size, num_layers,
+            batch_first=True, dropout=dropout if num_layers > 1 else 0.0
+        )
+        self.fc = torch.nn.Linear(hidden_size, horizon)
+
+    def forward(self, x):
+        out, _ = self.lstm(x)
+        return self.fc(out[:, -1, :])
+
+
+def train_lstm(daily: pd.DataFrame, horizon: int, encoder_len: int, epochs: int) -> dict:
+    """Train LSTM on aggregated daily Total_Cost, return metrics dict."""
+    import torch.optim as optim
+    from torch.utils.data import DataLoader
+
+    log.info("─── Training LSTM (horizon=%d, encoder=%d) ───", horizon, encoder_len)
+
+    feature_cols = [
+        TARGET, "lag_1", "lag_7", "lag_14",
+        "rolling_7", "rolling_14", "rolling_30",
+        "dow_sin", "dow_cos", "month_sin", "month_cos",
+        "is_promoted", "discount_flag", "season_enc",
+    ]
+
+    # Aggregate across all cities/stores for a global model
+    global_daily = (
+        daily.groupby(DATE_COL)[feature_cols].sum()
+        .reset_index()
+        .sort_values(DATE_COL)
+    )
+
+    scaler = MinMaxScaler()
+    scaled = scaler.fit_transform(global_daily[feature_cols].values)
+
+    n_train = int(len(scaled) * 0.8)
+    train_ds = LSTMDataset(scaled[:n_train],  encoder_len, horizon)
+    val_ds   = LSTMDataset(scaled[n_train:],  encoder_len, horizon)
+
+    train_dl = DataLoader(train_ds, batch_size=32, shuffle=True)
+    val_dl   = DataLoader(val_ds,   batch_size=32, shuffle=False)
+
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    model  = LSTMForecaster(
+        input_size=len(feature_cols),
+        hidden_size=128,
+        num_layers=2,
+        horizon=horizon,
+    ).to(device)
+
+    optimizer = optim.Adam(model.parameters(), lr=1e-3)
+    scheduler = optim.lr_scheduler.ReduceLROnPlateau(optimizer, patience=5, factor=0.5)
+    criterion = torch.nn.HuberLoss()
+
+    best_val_loss = float("inf")
+    best_state    = None
+
+    for epoch in range(1, epochs + 1):
+        # Train
+        model.train()
+        train_loss = 0.0
+        for xb, yb in train_dl:
+            xb, yb = xb.to(device), yb.to(device)
+            optimizer.zero_grad()
+            pred = model(xb)
+            loss = criterion(pred, yb)
+            loss.backward()
+            torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+            optimizer.step()
+            train_loss += loss.item() * len(xb)
+        train_loss /= len(train_ds)
+
+        # Validate
+        model.eval()
+        val_loss = 0.0
+        with torch.no_grad():
+            for xb, yb in val_dl:
+                xb, yb = xb.to(device), yb.to(device)
+                val_loss += criterion(model(xb), yb).item() * len(xb)
+        val_loss /= max(len(val_ds), 1)
+        scheduler.step(val_loss)
+
+        if val_loss < best_val_loss:
+            best_val_loss = val_loss
+            best_state    = {k: v.clone() for k, v in model.state_dict().items()}
+
+        if epoch % 10 == 0 or epoch == 1:
+            log.info("  Epoch %3d/%d  train_loss=%.4f  val_loss=%.4f", epoch, epochs, train_loss, val_loss)
+
+    # Restore best weights and compute MAPE on val set
+    model.load_state_dict(best_state)
+    model.eval()
+    all_preds, all_true = [], []
+    with torch.no_grad():
+        for xb, yb in val_dl:
+            all_preds.append(model(xb.to(device)).cpu().numpy())
+            all_true.append(yb.numpy())
+
+    preds = np.concatenate(all_preds)
+    trues = np.concatenate(all_true)
+
+    # Inverse-scale the target column (index 0)
+    dummy = np.zeros((preds.shape[0] * horizon, len(feature_cols)))
+    dummy[:, 0] = preds.flatten()
+    preds_inv = scaler.inverse_transform(dummy)[:, 0].reshape(-1, horizon)
+    dummy[:, 0] = trues.flatten()
+    trues_inv = scaler.inverse_transform(dummy)[:, 0].reshape(-1, horizon)
+
+    mape = np.mean(np.abs((trues_inv - preds_inv) / (np.abs(trues_inv) + 1e-8))) * 100
+    mae  = np.mean(np.abs(trues_inv - preds_inv))
+    rmse = np.sqrt(np.mean((trues_inv - preds_inv) ** 2))
+    log.info("LSTM  →  MAPE=%.2f%%  MAE=%.2f  RMSE=%.2f", mape, mae, rmse)
+
+    # Save artefacts
+    torch.save(best_state, OUTPUT_DIR / "lstm_best.pt")
+    import joblib
+    joblib.dump(scaler, OUTPUT_DIR / "lstm_scaler.pkl")
+
+    return {"model": "LSTM", "mape": round(mape, 2), "mae": round(mae, 2), "rmse": round(rmse, 2)}
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# TEMPORAL FUSION TRANSFORMER
+# ══════════════════════════════════════════════════════════════════════════════
+
+def train_tft(daily: pd.DataFrame, horizon: int, encoder_len: int, epochs: int) -> dict:
+    """
+    Train a Temporal Fusion Transformer using pytorch-forecasting.
+    Known future covariates: is_promoted, discount_flag, season_enc.
+    Static categoricals: City, Store_Type.
+    """
+    try:
+        import pytorch_lightning as pl
+        from pytorch_forecasting import TemporalFusionTransformer, TimeSeriesDataSet
+        from pytorch_forecasting.data import GroupNormalizer
+        from pytorch_forecasting.metrics import QuantileLoss
+        from pytorch_lightning.callbacks import EarlyStopping, ModelCheckpoint
+    except ImportError:
+        log.error(
+            "pytorch-forecasting not installed.\n"
+            "Install with: pip install pytorch-forecasting pytorch-lightning"
+        )
+        raise
+
+    log.info("─── Training TFT (horizon=%d, encoder=%d) ───", horizon, encoder_len)
+
+    df = daily.copy()
+
+    # TFT requires integer time index per group
+    le_city  = LabelEncoder()
+    le_store = LabelEncoder()
+    df["city_enc"]  = le_city.fit_transform(df[CITY_COL])
+    df["store_enc"] = le_store.fit_transform(df[STORE_COL])
+    df["group_id"]  = df["city_enc"].astype(str) + "_" + df["store_enc"].astype(str)
+    df["time_idx"]  = (
+        df.groupby("group_id")[DATE_COL]
+        .transform(lambda x: (x - x.min()).dt.days)
+        .astype(int)
+    )
+
+    max_time_idx = df["time_idx"].max()
+    train_cutoff = max_time_idx - horizon * 2   # leave 2× horizon for validation
+
+    training_df = df[df["time_idx"] <= train_cutoff]
+    val_df      = df[df["time_idx"] >  train_cutoff - encoder_len]  # overlap for context
+
+    known_future_reals = ["is_promoted", "discount_flag"]
+    time_varying_reals = [
+        TARGET, "lag_1", "lag_7", "lag_14",
+        "rolling_7", "rolling_14", "rolling_30",
+        "dow_sin", "dow_cos", "month_sin", "month_cos",
+    ] + known_future_reals
+
+    training = TimeSeriesDataSet(
+        training_df,
+        time_idx                   = "time_idx",
+        target                     = TARGET,
+        group_ids                  = ["group_id"],
+        min_encoder_length         = encoder_len // 2,
+        max_encoder_length         = encoder_len,
+        min_prediction_length      = 1,
+        max_prediction_length      = horizon,
+        static_categoricals        = ["group_id"],
+        time_varying_known_reals   = known_future_reals + ["dow_sin", "dow_cos", "month_sin", "month_cos"],
+        time_varying_unknown_reals = [
+            TARGET, "lag_1", "lag_7", "lag_14",
+            "rolling_7", "rolling_14", "rolling_30",
+        ],
+        target_normalizer          = GroupNormalizer(groups=["group_id"], transformation="softplus"),
+        add_relative_time_idx      = True,
+        add_target_scales          = True,
+        add_encoder_length         = True,
+        allow_missing_timesteps    = True,
+    )
+
+    validation = TimeSeriesDataSet.from_dataset(training, val_df, predict=True, stop_randomization=True)
+
+    train_dl = training.to_dataloader(train=True,  batch_size=64, num_workers=0)
+    val_dl   = validation.to_dataloader(train=False, batch_size=64, num_workers=0)
+
+    model = TemporalFusionTransformer.from_dataset(
+        training,
+        learning_rate       = 3e-3,
+        hidden_size         = 64,
+        attention_head_size = 2,
+        dropout             = 0.1,
+        hidden_continuous_size = 32,
+        output_size         = 7,          # 7 quantiles
+        loss                = QuantileLoss(),
+        log_interval        = 10,
+        reduce_on_plateau_patience = 4,
+    )
+    log.info("TFT parameter count: %d", sum(p.numel() for p in model.parameters()))
+
+    checkpoint_cb = ModelCheckpoint(
+        dirpath   = str(OUTPUT_DIR),
+        filename  = "tft_best",
+        monitor   = "val_loss",
+        mode      = "min",
+        save_top_k = 1,
+    )
+    early_stop_cb = EarlyStopping(monitor="val_loss", patience=8, mode="min")
+
+    trainer = pl.Trainer(
+        max_epochs          = epochs,
+        accelerator         = "gpu" if torch.cuda.is_available() else "cpu",
+        devices             = 1,
+        enable_progress_bar = True,
+        callbacks           = [checkpoint_cb, early_stop_cb],
+        gradient_clip_val   = 0.1,
+    )
+
+    trainer.fit(model, train_dataloaders=train_dl, val_dataloaders=val_dl)
+
+    # Load best checkpoint for evaluation
+    best_model = TemporalFusionTransformer.load_from_checkpoint(checkpoint_cb.best_model_path)
+    best_model.eval()
+
+    predictions = best_model.predict(val_dl, return_y=True)
+    pred_vals   = predictions.output.numpy()         # median (quantile 0.5)
+    true_vals   = predictions.y[0].numpy()
+
+    mape = np.mean(np.abs((true_vals - pred_vals) / (np.abs(true_vals) + 1e-8))) * 100
+    mae  = np.mean(np.abs(true_vals - pred_vals))
+    rmse = np.sqrt(np.mean((true_vals - pred_vals) ** 2))
+    log.info("TFT  →  MAPE=%.2f%%  MAE=%.2f  RMSE=%.2f", mape, mae, rmse)
+
+    return {"model": "TFT", "mape": round(mape, 2), "mae": round(mae, 2), "rmse": round(rmse, 2)}
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# MLFLOW LOGGING
+# ══════════════════════════════════════════════════════════════════════════════
+
+def log_to_mlflow(metrics: dict, params: dict):
+    mlflow.set_experiment("deep-forecasting")
+    with mlflow.start_run(run_name=metrics["model"]):
+        mlflow.log_params(params)
+        mlflow.log_metric("mape", metrics["mape"])
+        mlflow.log_metric("mae",  metrics["mae"])
+        mlflow.log_metric("rmse", metrics["rmse"])
+        for f in OUTPUT_DIR.glob("*.pt"):
+            mlflow.log_artifact(str(f))
+        for f in OUTPUT_DIR.glob("*.pkl"):
+            mlflow.log_artifact(str(f))
+        for f in OUTPUT_DIR.glob("*.ckpt"):
+            mlflow.log_artifact(str(f))
+    log.info("MLflow run logged for %s", metrics["model"])
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# ENTRY POINT
+# ══════════════════════════════════════════════════════════════════════════════
+
+def main():
+    parser = argparse.ArgumentParser(description="NeuralRetail deep forecasting trainer")
+    parser.add_argument("--model",       choices=["lstm", "tft", "both"], default="tft")
+    parser.add_argument("--horizon",     type=int, default=DEFAULT_HORIZON)
+    parser.add_argument("--encoder-len", type=int, default=DEFAULT_ENCODER)
+    parser.add_argument("--epochs",      type=int, default=DEFAULT_EPOCHS)
+    parser.add_argument("--data",        type=str, default=str(DATA_PATH))
+    args = parser.parse_args()
+
+    params = {
+        "horizon":     args.horizon,
+        "encoder_len": args.encoder_len,
+        "epochs":      args.epochs,
+    }
+
+    daily, _ = load_and_aggregate(Path(args.data))
+    daily    = add_time_features(daily)
+
+    results = []
+    if args.model in ("lstm", "both"):
+        m = train_lstm(daily, args.horizon, args.encoder_len, args.epochs)
+        log_to_mlflow(m, {**params, "model": "LSTM"})
+        results.append(m)
+
+    if args.model in ("tft", "both"):
+        m = train_tft(daily, args.horizon, args.encoder_len, args.epochs)
+        log_to_mlflow(m, {**params, "model": "TFT"})
+        results.append(m)
+
+    print("\n── Results ─────────────────────────────")
+    for r in results:
+        print(f"  {r['model']:6s}  MAPE={r['mape']:6.2f}%  MAE={r['mae']:.2f}  RMSE={r['rmse']:.2f}")
+    print("─────────────────────────────────────────\n")
+
+    if len(results) == 2:
+        winner = min(results, key=lambda x: x["mape"])
+        print(f"✅  Best model by MAPE: {winner['model']} ({winner['mape']}%)")
+
+
+if __name__ == "__main__":
+    main()

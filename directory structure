@@ -1,0 +1,1 @@
+mkdir -p /home/claude/neural-retail/{src/{models,dashboard/pages,kafka},k8s,.github/workflows,scripts}

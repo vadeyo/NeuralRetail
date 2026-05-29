@@ -1,0 +1,339 @@
+"""
+NeuralRetail — City-Level Geographic Heatmap
+=============================================
+Streamlit page: src/dashboard/pages/5_Geography.py
+
+Displays interactive choropleth and bubble maps showing:
+  - Revenue (Total_Cost) by city
+  - Transaction volume by city
+  - Churn rate by city
+  - Average basket size by city
+  - Promotion uptake by city
+
+Requires: pip install streamlit plotly pandas
+"""
+
+import json
+from pathlib import Path
+
+import pandas as pd
+import plotly.express as px
+import plotly.graph_objects as go
+import streamlit as st
+
+# ── City coordinate lookup (covers most common US cities in the dataset) ──────
+CITY_COORDS = {
+    "New York":     (40.7128, -74.0060),
+    "Los Angeles":  (34.0522, -118.2437),
+    "Chicago":      (41.8781, -87.6298),
+    "Houston":      (29.7604, -95.3698),
+    "Phoenix":      (33.4484, -112.0740),
+    "Philadelphia": (39.9526, -75.1652),
+    "San Antonio":  (29.4241, -98.4936),
+    "San Diego":    (32.7157, -117.1611),
+    "Dallas":       (32.7767, -96.7970),
+    "San Jose":     (37.3382, -121.8863),
+    "Austin":       (30.2672, -97.7431),
+    "Jacksonville": (30.3322, -81.6557),
+    "Fort Worth":   (32.7555, -97.3308),
+    "Columbus":     (39.9612, -82.9988),
+    "Charlotte":    (35.2271, -80.8431),
+    "Indianapolis": (39.7684, -86.1581),
+    "Seattle":      (47.6062, -122.3321),
+    "Denver":       (39.7392, -104.9903),
+    "Washington":   (38.9072, -77.0369),
+    "Nashville":    (36.1627, -86.7816),
+    "Oklahoma City":(35.4676, -97.5164),
+    "El Paso":      (31.7619, -106.4850),
+    "Boston":       (42.3601, -71.0589),
+    "Portland":     (45.5231, -122.6765),
+    "Las Vegas":    (36.1699, -115.1398),
+    "Memphis":      (35.1495, -90.0490),
+    "Louisville":   (38.2527, -85.7585),
+    "Baltimore":    (39.2904, -76.6122),
+    "Milwaukee":    (43.0389, -87.9065),
+    "Albuquerque":  (35.0844, -106.6504),
+    "Tucson":       (32.2226, -110.9747),
+    "Fresno":       (36.7378, -119.7871),
+    "Sacramento":   (38.5816, -121.4944),
+    "Mesa":         (33.4152, -111.8315),
+    "Kansas City":  (39.0997, -94.5786),
+    "Atlanta":      (33.7490, -84.3880),
+    "Omaha":        (41.2565, -95.9345),
+    "Colorado Springs":(38.8339,-104.8214),
+    "Raleigh":      (35.7796, -78.6382),
+    "Miami":        (25.7617, -80.1918),
+    "Minneapolis":  (44.9778, -93.2650),
+    "Tulsa":        (36.1540, -95.9928),
+    "Tampa":        (27.9506, -82.4572),
+    "New Orleans":  (29.9511, -90.0715),
+    "Cleveland":    (41.4993, -81.6944),
+    "Honolulu":     (21.3069, -157.8583),
+    "Bakersfield":  (35.3733, -119.0187),
+    "Aurora":       (39.7294, -104.8319),
+    "Anaheim":      (33.8366, -117.9143),
+    "Santa Ana":    (33.7455, -117.8677),
+    "Corpus Christi":(27.8006,-97.3964),
+    "Riverside":    (33.9533, -117.3961),
+    "Lexington":    (38.0406, -84.5037),
+    "Pittsburgh":   (40.4406, -79.9959),
+    "Stockton":     (37.9577, -121.2908),
+    "Anchorage":    (61.2181, -149.9003),
+    "Cincinnati":   (39.1031, -84.5120),
+    "St. Louis":    (38.6270, -90.1994),
+    "St. Paul":     (44.9537, -93.0900),
+}
+
+DATA_PATH = Path("data/raw/retail_transactions.csv")
+
+
+@st.cache_data(ttl=600, show_spinner="Loading transaction data …")
+def load_city_data(path: Path) -> pd.DataFrame:
+    df = pd.read_csv(path, parse_dates=["Date"])
+
+    # Aggregate by city
+    city_agg = df.groupby("City").agg(
+        total_revenue    = ("Total_Cost",       "sum"),
+        transaction_count= ("Transaction_ID",   "count"),
+        avg_basket       = ("Total_Cost",        "mean"),
+        avg_items        = ("Total_Items",       "mean"),
+        promo_rate       = ("Promotion",         lambda x: (x != "None").mean()),
+        discount_rate    = ("Discount_Applied",  "mean"),
+        unique_customers = ("Customer_Name",     "nunique"),
+    ).reset_index()
+
+    # Compute churn rate: customers with recency > 90 days
+    snapshot = df["Date"].max()
+    last_seen = df.groupby("Customer_Name").agg(
+        last_date = ("Date", "max"),
+        city      = ("City", "last"),
+    ).reset_index()
+    last_seen["churned"] = (snapshot - last_seen["last_date"]).dt.days > 90
+    churn_by_city = (
+        last_seen.groupby("city")
+        .agg(churn_rate=("churned", "mean"))
+        .reset_index()
+        .rename(columns={"city": "City"})
+    )
+    city_agg = city_agg.merge(churn_by_city, on="City", how="left")
+
+    # Attach coordinates
+    city_agg["lat"] = city_agg["City"].map(lambda c: CITY_COORDS.get(c, (None, None))[0])
+    city_agg["lon"] = city_agg["City"].map(lambda c: CITY_COORDS.get(c, (None, None))[1])
+    city_agg = city_agg.dropna(subset=["lat", "lon"])
+
+    return city_agg
+
+
+def render():
+    st.set_page_config(page_title="Geography · NeuralRetail", layout="wide", page_icon="🗺️")
+
+    st.title("🗺️ City-Level Geographic Intelligence")
+    st.caption(
+        "Revenue, churn, basket size and promotion uptake mapped across cities. "
+        "Use the controls below to switch metrics."
+    )
+
+    if not DATA_PATH.exists():
+        st.error(
+            f"Dataset not found at `{DATA_PATH}`. "
+            "Download from Kaggle and place at `data/raw/retail_transactions.csv`."
+        )
+        st.stop()
+
+    df = load_city_data(DATA_PATH)
+
+    # ── Controls ─────────────────────────────────────────────────────────────
+    col_ctrl1, col_ctrl2, col_ctrl3 = st.columns([2, 2, 2])
+    with col_ctrl1:
+        metric = st.selectbox(
+            "Metric",
+            options=[
+                "total_revenue",
+                "transaction_count",
+                "avg_basket",
+                "churn_rate",
+                "promo_rate",
+                "discount_rate",
+                "unique_customers",
+            ],
+            format_func=lambda x: {
+                "total_revenue":     "Total Revenue ($)",
+                "transaction_count": "Transaction Count",
+                "avg_basket":        "Avg Basket Value ($)",
+                "churn_rate":        "Churn Rate (%)",
+                "promo_rate":        "Promotion Uptake (%)",
+                "discount_rate":     "Discount Rate (%)",
+                "unique_customers":  "Unique Customers",
+            }[x],
+        )
+    with col_ctrl2:
+        map_style = st.radio("Map type", ["Bubble map", "Choropleth (US states)"], horizontal=True)
+    with col_ctrl3:
+        top_n = st.slider("Show top N cities", min_value=5, max_value=len(df), value=min(20, len(df)))
+
+    df_top = df.nlargest(top_n, metric)
+
+    # Format label
+    label_fmt = {
+        "total_revenue":     lambda v: f"${v:,.0f}",
+        "transaction_count": lambda v: f"{v:,}",
+        "avg_basket":        lambda v: f"${v:.2f}",
+        "churn_rate":        lambda v: f"{v*100:.1f}%",
+        "promo_rate":        lambda v: f"{v*100:.1f}%",
+        "discount_rate":     lambda v: f"{v*100:.1f}%",
+        "unique_customers":  lambda v: f"{v:,}",
+    }
+    df_top["label"] = df_top[metric].apply(label_fmt[metric])
+
+    # ── Map ───────────────────────────────────────────────────────────────────
+    color_scales = {
+        "total_revenue":     "Viridis",
+        "transaction_count": "Blues",
+        "avg_basket":        "Teal",
+        "churn_rate":        "Reds",
+        "promo_rate":        "Purples",
+        "discount_rate":     "Oranges",
+        "unique_customers":  "Greens",
+    }
+
+    if map_style == "Bubble map":
+        fig = px.scatter_mapbox(
+            df_top,
+            lat           = "lat",
+            lon           = "lon",
+            size          = metric,
+            color         = metric,
+            hover_name    = "City",
+            hover_data    = {
+                "total_revenue":     ":.0f",
+                "transaction_count": True,
+                "avg_basket":        ":.2f",
+                "churn_rate":        ":.2%",
+                "promo_rate":        ":.2%",
+                "unique_customers":  True,
+                "lat":               False,
+                "lon":               False,
+            },
+            color_continuous_scale = color_scales[metric],
+            size_max      = 50,
+            zoom          = 3,
+            mapbox_style  = "carto-positron",
+            title         = f"{metric.replace('_', ' ').title()} by City",
+        )
+        fig.update_layout(
+            height              = 520,
+            margin              = dict(l=0, r=0, t=40, b=0),
+            coloraxis_colorbar  = dict(title=metric.replace("_", " ").title()),
+        )
+        st.plotly_chart(fig, use_container_width=True)
+
+    else:  # Choropleth on US state level (aggregated from city data)
+        # Map city → state abbreviation for choropleth
+        CITY_STATE = {
+            "New York": "NY", "Los Angeles": "CA", "Chicago": "IL", "Houston": "TX",
+            "Phoenix": "AZ", "Philadelphia": "PA", "San Antonio": "TX", "San Diego": "CA",
+            "Dallas": "TX", "San Jose": "CA", "Austin": "TX", "Jacksonville": "FL",
+            "Fort Worth": "TX", "Columbus": "OH", "Charlotte": "NC", "Indianapolis": "IN",
+            "Seattle": "WA", "Denver": "CO", "Washington": "DC", "Nashville": "TN",
+            "Oklahoma City": "OK", "El Paso": "TX", "Boston": "MA", "Portland": "OR",
+            "Las Vegas": "NV", "Memphis": "TN", "Louisville": "KY", "Baltimore": "MD",
+            "Milwaukee": "WI", "Albuquerque": "NM", "Tucson": "AZ", "Fresno": "CA",
+            "Sacramento": "CA", "Mesa": "AZ", "Kansas City": "MO", "Atlanta": "GA",
+            "Omaha": "NE", "Colorado Springs": "CO", "Raleigh": "NC", "Miami": "FL",
+            "Minneapolis": "MN", "Tulsa": "OK", "Tampa": "FL", "New Orleans": "LA",
+            "Cleveland": "OH", "Honolulu": "HI", "Bakersfield": "CA", "Aurora": "CO",
+            "Anaheim": "CA", "Santa Ana": "CA", "Corpus Christi": "TX", "Riverside": "CA",
+            "Lexington": "KY", "Pittsburgh": "PA", "Stockton": "CA", "Anchorage": "AK",
+            "Cincinnati": "OH", "St. Louis": "MO", "St. Paul": "MN",
+        }
+        df_state = df_top.copy()
+        df_state["state"] = df_state["City"].map(CITY_STATE)
+        state_agg = df_state.groupby("state")[metric].sum().reset_index()
+
+        choropleth = px.choropleth(
+            state_agg,
+            locations         = "state",
+            locationmode      = "USA-states",
+            color             = metric,
+            scope             = "usa",
+            color_continuous_scale = color_scales[metric],
+            title             = f"{metric.replace('_', ' ').title()} by State",
+            labels            = {metric: metric.replace("_", " ").title()},
+        )
+        choropleth.update_layout(height=480, margin=dict(l=0, r=0, t=40, b=0))
+        st.plotly_chart(choropleth, use_container_width=True)
+
+    # ── Top Cities Table ──────────────────────────────────────────────────────
+    st.subheader(f"Top {top_n} Cities — {metric.replace('_', ' ').title()}")
+    display_df = (
+        df_top[["City", "total_revenue", "transaction_count", "avg_basket",
+                "churn_rate", "promo_rate", "unique_customers"]]
+        .sort_values(metric, ascending=False)
+        .reset_index(drop=True)
+    )
+    display_df.index += 1
+    display_df.columns = [
+        "City", "Revenue ($)", "Transactions", "Avg Basket ($)",
+        "Churn Rate", "Promo Rate", "Unique Customers"
+    ]
+    display_df["Revenue ($)"]    = display_df["Revenue ($)"].map("${:,.0f}".format)
+    display_df["Transactions"]   = display_df["Transactions"].map("{:,}".format)
+    display_df["Avg Basket ($)"] = display_df["Avg Basket ($)"].map("${:.2f}".format)
+    display_df["Churn Rate"]     = display_df["Churn Rate"].map("{:.1%}".format)
+    display_df["Promo Rate"]     = display_df["Promo Rate"].map("{:.1%}".format)
+    display_df["Unique Customers"]= display_df["Unique Customers"].map("{:,}".format)
+    st.dataframe(display_df, use_container_width=True)
+
+    # ── City Comparison Bar Chart ─────────────────────────────────────────────
+    st.subheader("City Comparison")
+    bar_fig = px.bar(
+        df_top.sort_values(metric, ascending=True),
+        x         = metric,
+        y         = "City",
+        orientation = "h",
+        color     = metric,
+        color_continuous_scale = color_scales[metric],
+        text      = "label",
+        title     = f"{metric.replace('_', ' ').title()} — Ranked",
+    )
+    bar_fig.update_layout(
+        height           = max(300, top_n * 28),
+        showlegend       = False,
+        coloraxis_showscale = False,
+        margin           = dict(l=10, r=10, t=40, b=10),
+        xaxis_title      = "",
+        yaxis_title      = "",
+    )
+    bar_fig.update_traces(textposition="outside")
+    st.plotly_chart(bar_fig, use_container_width=True)
+
+    # ── Correlation Scatter ───────────────────────────────────────────────────
+    st.subheader("Revenue vs Churn Rate by City")
+    scatter = px.scatter(
+        df,
+        x         = "total_revenue",
+        y         = "churn_rate",
+        size      = "transaction_count",
+        color     = "avg_basket",
+        hover_name= "City",
+        color_continuous_scale = "Teal",
+        labels    = {
+            "total_revenue":     "Total Revenue ($)",
+            "churn_rate":        "Churn Rate",
+            "transaction_count": "Transaction Count",
+            "avg_basket":        "Avg Basket ($)",
+        },
+        title = "Revenue vs Churn Rate (bubble size = transaction volume)",
+    )
+    scatter.update_layout(height=420, margin=dict(l=10, r=10, t=40, b=10))
+    scatter.update_yaxes(tickformat=".0%")
+    st.plotly_chart(scatter, use_container_width=True)
+
+    st.caption("Data: Retail Transactions Dataset (Kaggle · prasad22)")
+
+
+if __name__ == "__main__":
+    render()
+else:
+    render()
